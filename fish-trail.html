@@ -1,0 +1,828 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fish Trail — Classic / Trajectory / Sine Channel / Timed Taps / Music Trail / Mirror</title>
+  <style>
+    html,body { height: 100%; margin: 0; background: linear-gradient(180deg, #0e1a22, #0f2632); color: #e9f5fb; font-family: system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif; overflow: hidden; }
+    canvas { display:block; margin:0; background:transparent; }
+    .hint { position: fixed; bottom: 12px; left: 0; right: 0; text-align: center; opacity: .75; font-size: 14px; pointer-events: none; }
+    .gate { position: fixed; inset: 0; display: grid; place-items: center; background: rgba(0,0,0,.55); z-index: 10; }
+    .gate .card { background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.15); border-radius: 14px; padding: 16px 20px; text-align: center; backdrop-filter: blur(4px); }
+    .gate button { margin-top: 10px; border: 0; border-radius: 999px; padding: 10px 18px; font-weight: 700; background: #5bd4ff; color: #05222e; cursor: pointer; }
+    .music-toggle {
+      position: fixed; top: 12px; right: 12px; z-index: 20;
+      background: rgba(255,255,255,.08);
+      border: 1px solid rgba(255,255,255,.15);
+      border-radius: 999px; padding: 8px 12px; font-weight: 700;
+      cursor: pointer; color: #e9f5fb; backdrop-filter: blur(4px);
+    }
+    .music-toggle:hover { background: rgba(255,255,255,.12); }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <button id="musicToggle" class="music-toggle">Music: On</button>
+  <div class="hint">
+    Classic: collect freely. Trajectory: follow the path. Sine Channel: stay in channel & hit targets.
+    Timed Taps: reach quick targets before they vanish. Music Trail: relax & drift. Mirror: match the ghost fish!
+  </div>
+  <audio id="coinSound" src="https://cdn.jsdelivr.net/gh/naptha/tiny-sfx/coin.wav" preload="auto"></audio>
+
+  <div class="gate" id="gate">
+    <div class="card">
+      <div style="font-size:18px;font-weight:700;margin-bottom:6px;">Select Game Mode</div>
+      <div style="opacity:.85">This enables sound in your browser.</div>
+      <button id="startBtn">Classic Mode</button>
+    </div>
+  </div>
+
+  <script>
+  // ===== Canvas / sizing =====
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let W = window.innerWidth, H = window.innerHeight;
+  function resize() { W = innerWidth; H = innerHeight; canvas.width = W; canvas.height = H; }
+  resize();
+  addEventListener('resize', resize);
+
+  // ===== Input / player =====
+  const mouse = { x: W/2, y: H/2 };
+  canvas.addEventListener('mousemove', e => {
+    const r = canvas.getBoundingClientRect();
+    mouse.x = e.clientX - r.left; mouse.y = e.clientY - r.top;
+  });
+  const shield = { x: mouse.x, y: mouse.y, r: 0.1 * Math.min(W,H) };
+  addEventListener('resize', () => { shield.r = 0.1 * Math.min(W,H); });
+
+  // ===== Audio =====
+  const coinEl = document.getElementById('coinSound');
+  let audioReady = false, ac = null;
+  function initAudioContext(){ try{ ac=new (AudioContext||webkitAudioContext)(); }catch{ ac=null; } }
+  function beepFallback(){ if(!ac) return; const o=ac.createOscillator(), g=ac.createGain(); o.type='sine'; o.frequency.value=880; g.gain.value=0.0001; o.connect(g).connect(ac.destination); o.start(); g.gain.exponentialRampToValueAtTime(0.2, ac.currentTime+0.01); g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime+0.15); o.stop(ac.currentTime+0.16); }
+  function playCoin(){ if(!audioReady) return; try { const s = coinEl.cloneNode(); s.volume = 0.75; const p = s.play(); if (p && p.catch) p.catch(()=>beepFallback()); } catch { beepFallback(); } }
+
+  // ===== Clapping audio =====
+  let clapCooldownUntil = 0;
+  function playClap(){
+    if (!ac || !audioReady) return;
+    const nowMs = performance.now();
+    if (nowMs < clapCooldownUntil) return;
+    clapCooldownUntil = nowMs + 900;
+
+    const buffer = ac.createBuffer(1, ac.sampleRate * 0.35, ac.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i=0;i<data.length;i++){
+      const t = i / ac.sampleRate;
+      const env = Math.exp(-t * 18);
+      const click = (Math.random()*2-1) * (0.6 + 0.4*Math.random());
+      data[i] = click * env;
+    }
+    [0, 0.06, 0.12].forEach((ofs, k) => {
+      const src = ac.createBufferSource(); src.buffer = buffer;
+      const bp = ac.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value = 1600 + k*150; bp.Q.value = 2.5;
+      const g = ac.createGain(); g.gain.value = 0.001;
+      src.connect(bp).connect(g).connect(ac.destination);
+      const t0 = ac.currentTime + ofs;
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.linearRampToValueAtTime(0.22, t0 + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.18);
+      try { src.start(t0); } catch {}
+    });
+  }
+
+  // ===== Global state =====
+  let gameMode = null;
+  let score = 0;
+
+  // Streak detector
+  const praise = { last: 0, count: 0, windowMs: 1800 };
+  function markGreat(){
+    const now = performance.now();
+    if (now - praise.last > praise.windowMs) praise.count = 0;
+    praise.last = now;
+    praise.count++;
+    if (praise.count >= 3) { playClap(); praise.count = 0; }
+  }
+
+  // ===== Classic =====
+  let coins = [];
+  function initCoins() {
+    coins = Array.from({ length: 24 }, () => ({ x: Math.random()*(W-80)+40, y: Math.random()*(H-80)+40, taken:false }));
+  }
+
+  // ===== Trajectory =====
+  let currentTarget = 0;
+  let pathCoins = [];
+  let pathPoints = [];
+  function initPathCoins() {
+    const targetCount = 10, waveSamples = 200;
+    const amplitude = H * 0.25, frequency = 2, margin = 60;
+    pathPoints = [];
+    for (let i = 0; i <= waveSamples; i++) {
+      const t = i / waveSamples;
+      const x = margin + t * (W - 2 * margin);
+      const y = H / 2 + Math.sin(t * frequency * 2 * Math.PI) * amplitude;
+      pathPoints.push({ x, y });
+    }
+    pathCoins = [];
+    for (let i = 0; i < targetCount; i++) {
+      const index = Math.floor((i / (targetCount - 1)) * waveSamples);
+      const { x, y } = pathPoints[index];
+      pathCoins.push({ x, y, taken: false });
+    }
+    currentTarget = 0;
+  }
+  function drawPathLine() {
+    if (pathPoints.length < 2) return;
+    ctx.beginPath();
+    ctx.strokeStyle = '#00ffff';
+    ctx.lineWidth = 2;
+    ctx.moveTo(pathPoints[0].x, pathPoints[0].y);
+    for (let i = 1; i < pathPoints.length; i++) ctx.lineTo(pathPoints[i].x, pathPoints[i].y);
+    ctx.stroke();
+  }
+
+  // ===== Sine Channel =====
+  let channelFunction = null;
+  let channelWidth = 150;
+  let channelFishX = 0;
+  let channelTargets = [];
+  function initChannelMode() {
+    channelFishX = 0;
+    const amplitude = H * 0.25, frequency = 2;
+    channelFunction = (x) => {
+      const t = x / W;
+      return H / 2 + Math.sin(t * frequency * 2 * Math.PI) * amplitude;
+    };
+    channelTargets = [];
+    const count = 12;
+    for (let i = 0; i < count; i++) {
+      const x = (i + 1) * W / (count + 1);
+      const y = channelFunction(x);
+      channelTargets.push({ x, y, taken: false });
+    }
+  }
+  function drawSineChannel() {
+    const step = 1;
+    ctx.beginPath();
+    for (let x = 0; x <= W; x += step) {
+      const y = channelFunction(x);
+      if (x === 0) ctx.moveTo(x, y - channelWidth / 2); else ctx.lineTo(x, y - channelWidth / 2);
+    }
+    for (let x = W; x >= 0; x -= step) {
+      const y = channelFunction(x);
+      ctx.lineTo(x, y + channelWidth / 2);
+    }
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(0, 255, 255, 0.15)';
+    ctx.fill();
+  }
+
+  // ===== Shared coin draw =====
+  function drawCoin(c, index, highlight=false){
+    ctx.save();
+    ctx.shadowColor = highlight ? '#00ffff' : '#ffd966';
+    ctx.shadowBlur = 12;
+    ctx.fillStyle = highlight ? '#00ffff' : '#ffd966';
+    const rad = Math.max(8, 0.012 * Math.min(W,H));
+    ctx.beginPath(); ctx.arc(c.x,c.y,rad,0,Math.PI*2); ctx.fill();
+    if (highlight) {
+      ctx.fillStyle = '#0e1a22';
+      ctx.font = '12px sans-serif';
+      ctx.fillText((index+1), c.x - 4, c.y + 4);
+    }
+    ctx.restore();
+  }
+
+  /* ======================
+     MUSIC TRAIL (Relaxation Mode)
+     ====================== */
+  let musicPhase = 0, musicSpeed = 0.5, musicWidth = 180;
+  let musicAmp = H * 0.22, musicFreq = 1.2;
+  let musicBubbles = [];
+  let ambient = { started:false, g:null, f:null, o1:null, o2:null, lfo:null, lfoGain:null };
+
+  addEventListener('resize', () => { musicAmp = H * 0.22; musicWidth = 180; });
+
+  function musicPathY(x){
+    const t = (x + musicPhase) / W;
+    return H/2
+      + Math.sin(t * musicFreq * 2*Math.PI) * musicAmp * 0.75
+      + Math.sin(t * (musicFreq*0.5) * 2*Math.PI + 1.4) * musicAmp * 0.25;
+  }
+  function initMusicTrail(){
+    musicPhase = 0;
+    musicBubbles = Array.from({length: 40}, () => ({
+      x: Math.random()*W, y: Math.random()*H,
+      r: Math.random()*3 + 1, s: Math.random()*0.4 + 0.2, a: Math.random()*0.4 + 0.2
+    }));
+    startAmbient();
+  }
+  function drawMusicRibbon(){
+    ctx.save();
+    ctx.beginPath();
+    for (let x=0; x<=W; x+=2){
+      const y = musicPathY(x);
+      if (x===0) ctx.moveTo(x, y - musicWidth/2);
+      else ctx.lineTo(x, y - musicWidth/2);
+    }
+    for (let x=W; x>=0; x-=2){
+      const y = musicPathY(x);
+      ctx.lineTo(x, y + musicWidth/2);
+    }
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(120, 220, 255, 0.10)';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(0, musicPathY(0));
+    for (let x=2; x<=W; x+=2) ctx.lineTo(x, musicPathY(x));
+    ctx.shadowColor = '#7af0ff'; ctx.shadowBlur = 14;
+    ctx.strokeStyle = 'rgba(140, 245, 255, 0.9)'; ctx.lineWidth = 3;
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.stroke();
+    ctx.restore();
+  }
+  function updateMusicTrail(){
+    musicPhase += musicSpeed;
+    shield.x += musicSpeed; if (shield.x > W + 20) shield.x = -20;
+    const pathY = musicPathY(shield.x);
+    const ease = 0.06, mouseBlend = 0.15;
+    const desiredY = pathY * (1 - mouseBlend) + mouse.y * mouseBlend;
+    shield.y += (desiredY - shield.y) * ease;
+    musicBubbles.forEach(b=>{ b.y -= b.s; if (b.y < -5) { b.y = H + 5; b.x = Math.random()*W; } });
+  }
+  function drawMusicBubbles(){
+    ctx.save();
+    for (const b of musicBubbles){
+      ctx.globalAlpha = b.a;
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI*2);
+      ctx.fillStyle = 'rgba(200, 245, 255, 0.35)'; ctx.fill();
+    }
+    ctx.globalAlpha = 1; ctx.restore();
+  }
+  function startAmbient(){
+    if (!ac || ambient.started) return;
+    ambient.started = true;
+    const g = ac.createGain(); g.gain.value = 0.0008;
+    const f = ac.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 1200;
+    const o1 = ac.createOscillator(); o1.type = 'sine'; o1.frequency.value = 220;
+    const o2 = ac.createOscillator(); o2.type = 'sine'; o2.frequency.value = 277.18;
+    const lfo = ac.createOscillator(); lfo.type = 'sine'; lfo.frequency.value = 0.08;
+    const lfoGain = ac.createGain(); lfoGain.gain.value = 12;
+    lfo.connect(lfoGain).connect(f.frequency);
+    o1.connect(f); o2.connect(f); f.connect(g).connect(ac.destination);
+    try { o1.start(); o2.start(); lfo.start(); } catch{}
+    ambient = { started:true, g, f, o1, o2, lfo, lfoGain };
+  }
+  function stopAmbient(){
+    if (!ambient.started) return;
+    try { ambient.o1.stop(); ambient.o2.stop(); ambient.lfo.stop(); } catch {}
+    try { ambient.g.disconnect(); ambient.f.disconnect(); } catch {}
+    ambient = { started:false, g:null, f:null, o1:null, o2:null, lfo:null, lfoGain:null };
+  }
+  function updateAmbient(){
+    if (!ambient.started || !ac) return;
+    const deviation = Math.abs(shield.y - musicPathY(shield.x));
+    const norm = Math.min(1, deviation / (musicWidth));
+    const baseFreq = 900, add = 900;
+    ambient.f.frequency.setTargetAtTime(baseFreq + add * (1 - norm), ac.currentTime, 0.3);
+    ambient.g.gain.setTargetAtTime(0.001 + 0.002 * (1 - norm), ac.currentTime, 0.4);
+  }
+
+  /* ================================
+     GLOBAL BACKGROUND MUSIC (all modes)
+     ================================ */
+  const musicBtn = document.getElementById('musicToggle');
+  let bgm = {
+    enabled: true,
+    started: false,
+    master: null,
+    padGain: null, padOscs: [],
+    noiseSrc: null, noiseGain: null, noiseFilter: null,
+    lfo: null, lfoGain: null
+  };
+  function setMusicButton(){ musicBtn.textContent = 'Music: ' + (bgm.enabled ? 'On' : 'Off'); }
+  function createNoiseBuffer(ctx, seconds=2){
+    const sampleRate = ctx.sampleRate;
+    const buffer = ctx.createBuffer(1, seconds * sampleRate, sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i=0; i<data.length; i++){ data[i] = (Math.random()*2 - 1) * 0.5; }
+    return buffer;
+  }
+  function startGlobalMusic(){
+    if (!ac || bgm.started || !bgm.enabled) return;
+    bgm.started = true;
+    const master = ac.createGain(); master.gain.value = 0.06; master.connect(ac.destination);
+    const padGain = ac.createGain(); padGain.gain.value = 0.12;
+    const padFreqs = [196, 246.94, 293.66];
+    const padOscs = padFreqs.map((f,i)=>{
+      const o = ac.createOscillator(); o.type = 'sine'; o.frequency.value = f;
+      const det = ac.createOscillator(); det.type='sine'; det.frequency.value = 0.03 + i*0.01;
+      const detGain = ac.createGain(); detGain.gain.value = 2.5; det.connect(detGain).connect(o.detune);
+      o.start(); det.start(); o.connect(padGain); return o;
+    });
+    const noiseSrc = ac.createBufferSource(); noiseSrc.buffer = createNoiseBuffer(ac, 3); noiseSrc.loop = true;
+    const noiseFilter = ac.createBiquadFilter(); noiseFilter.type='lowpass'; noiseFilter.frequency.value = 400;
+    const noiseGain = ac.createGain(); noiseGain.gain.value = 0.05;
+    const lfo = ac.createOscillator(); lfo.type='sine'; lfo.frequency.value = 0.06;
+    const lfoGain = ac.createGain(); lfoGain.gain.value = 180; lfo.connect(lfoGain).connect(noiseFilter.frequency);
+    padGain.connect(master);
+    noiseSrc.connect(noiseFilter).connect(noiseGain).connect(master);
+    bgm = { enabled:true, started:true, master, padGain, padOscs, noiseSrc, noiseGain, noiseFilter, lfo, lfoGain };
+    try { noiseSrc.start(); lfo.start(); } catch {}
+    master.gain.setTargetAtTime(0.06, ac.currentTime, 0.8);
+  }
+  function stopGlobalMusic(){
+    if (!bgm.started) return;
+    try { bgm.noiseSrc.stop(); bgm.lfo.stop(); } catch {}
+    try { bgm.padOscs.forEach(o=>o.stop()); bgm.master.disconnect(); } catch {}
+    bgm = { enabled:bgm.enabled, started:false, master:null, padGain:null, padOscs:[], noiseSrc:null, noiseGain:null, noiseFilter:null, lfo:null, lfoGain:null };
+  }
+  function setMusicEnabled(on){
+    bgm.enabled = on; setMusicButton();
+    if (!ac) return; if (on) startGlobalMusic(); else stopGlobalMusic();
+  }
+  musicBtn.onclick = () => { if (!ac) initAudioContext(); if (ac && ac.state==='suspended') ac.resume().catch(()=>{}); setMusicEnabled(!bgm.enabled); };
+  setMusicButton();
+
+  /* ===========================================================
+     ===== MIRROR MODE (Ghost Fish / Accuracy Scoring) =====
+     =========================================================== */
+  let ghost = { x: W/2, y: H/2, r: 0.02 * Math.min(W,H) };
+  // paths: 'sine' | 'circle' | 'liss' | 'horiz' | 'vert'
+  let ghostPath = 'sine';
+  let ghostT = 0;              // seconds
+  let ghostSpeed = 0.9;        // path speed multiplier
+  let ghostCenter = { x: W/2, y: H/2 };
+  let ghostAmp = { x: Math.min(W, H)*0.35, y: Math.min(W, H)*0.25 }; // amplitude (used by non-edge paths)
+  let ghostFreq = { x: 0.6, y: 0.9 }; // for liss
+  let mirrorTolerance = Math.min(W,H) * 0.12; // px for full score
+  const MIRROR_GOOD = 0.35; // fraction of tolerance
+  const MIRROR_OK   = 0.70;
+  let mirrorWasLocked = false;
+
+  // ===== Coin Rain FX (WIDER right band + BIGGER coins) =====
+  let coinFx = { items: [], spawnTimer: 0 };
+  function spawnCoinFx(n){
+    // Wider right-side band (approx right 40% of screen), with margins
+    const margin = 40;
+    const bandWidth = Math.max(240, W * 0.40);
+    const minX = Math.max(margin, W - bandWidth + margin);
+    const maxX = Math.min(W - margin, W - margin);
+    // Bigger coins
+    const baseR = Math.max(10, 0.02 * Math.min(W,H)); // previously ~0.012
+    for (let i=0;i<n;i++){
+      const x = minX + Math.random() * (maxX - minX);
+      const r = baseR * (0.8 + Math.random()*1.2);    // ~0.8x–2.0x base
+      const vy = 200 + Math.random()*220;             // slightly faster for larger coins
+      const rot = Math.random()*Math.PI*2;
+      const omega = (Math.random()*2 - 1) * 2.2;
+      const life = 1.2 + Math.random()*0.6;
+      const y = -30 - Math.random()*60;
+      coinFx.items.push({ x, y, r, vy, rot, omega, life, alpha: 1 });
+    }
+  }
+  function updateCoinFx(dt, locked){
+    if (locked){
+      coinFx.spawnTimer += dt;
+      const rate = 32; // a bit denser with larger coins
+      const toSpawn = Math.floor(coinFx.spawnTimer * rate);
+      if (toSpawn > 0){ coinFx.spawnTimer -= toSpawn / rate; spawnCoinFx(toSpawn); }
+    } else {
+      coinFx.spawnTimer = 0;
+    }
+    for (let i=coinFx.items.length-1;i>=0;i--){
+      const p = coinFx.items[i];
+      p.y += p.vy * dt;
+      p.rot += p.omega * dt;
+      p.life -= dt;
+      p.alpha = Math.max(0, p.life / 1.2);
+      if (p.life <= 0 || p.y > H + 40) coinFx.items.splice(i,1);
+    }
+  }
+  function drawCoinFx(){
+    for (const p of coinFx.items){
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.globalAlpha = Math.min(1, 0.9 * p.alpha + 0.1);
+      const g = ctx.createRadialGradient(0,0,p.r*0.3, 0,0,p.r);
+      g.addColorStop(0, '#fff7b3');
+      g.addColorStop(0.5, '#ffeb3b');
+      g.addColorStop(1, '#f4c20d');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(0,0,p.r,0,Math.PI*2); ctx.fill();
+      ctx.lineWidth = Math.max(1, p.r*0.12);
+      ctx.strokeStyle = 'rgba(255, 215, 64, 0.95)';
+      ctx.beginPath(); ctx.arc(0,0,p.r*0.92,0,Math.PI*2); ctx.stroke();
+      ctx.globalAlpha = 0.85 * p.alpha;
+      ctx.fillStyle = 'rgba(255,255,255,0.9)';
+      ctx.beginPath(); ctx.moveTo(0, -p.r*0.6); ctx.lineTo(p.r*0.2, -p.r*0.1); ctx.lineTo(0, 0); ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  addEventListener('resize', () => {
+    ghost.r = 0.02 * Math.min(W,H);
+    ghostCenter = { x: W/2, y: H/2 };
+    ghostAmp = { x: Math.min(W,H)*0.35, y: Math.min(W,H)*0.25 };
+    mirrorTolerance = Math.min(W,H) * 0.12;
+  });
+
+  function pickGhostPath(){
+    const types = ['sine','circle','liss'];
+    ghostPath = types[Math.floor(Math.random()*types.length)];
+  }
+  function initMirrorMode(pathOverride=null){
+    if (pathOverride) ghostPath = pathOverride; else pickGhostPath();
+    ghostT = 0;
+    shield.x = W*0.5; shield.y = H*0.5;
+    coinFx.items.length = 0; coinFx.spawnTimer = 0;
+    mirrorWasLocked = false;
+  }
+  function updateGhost(dt){
+    ghostT += dt * ghostSpeed;
+    if (ghostPath === 'sine'){
+      const t = ghostT;
+      ghost.x = ghostCenter.x + Math.sin(t * 1.2) * ghostAmp.x * 0.5;
+      ghost.y = ghostCenter.y + Math.sin(t * 0.8 + 1.1) * ghostAmp.y * 0.5;
+
+    } else if (ghostPath === 'circle'){
+      const t = ghostT, R = Math.min(W,H)*0.28;
+      ghost.x = ghostCenter.x + Math.cos(t * 0.9) * R;
+      ghost.y = ghostCenter.y + Math.sin(t * 0.9) * R * 0.7;
+
+    } else if (ghostPath === 'liss'){
+      const t = ghostT;
+      ghost.x = ghostCenter.x + Math.sin(t * ghostFreq.x + 0.7) * ghostAmp.x * 0.45;
+      ghost.y = ghostCenter.y + Math.sin(t * ghostFreq.y) * ghostAmp.y * 0.55;
+
+    } else if (ghostPath === 'horiz'){
+      // NEW: edge-to-edge (with margin)
+      const margin = Math.max(40, shield.r*0.6);
+      const span = Math.max(10, W - margin*2);
+      const t = ghostT;
+      const s = (Math.sin(t) * 0.5 + 0.5); // 0..1
+      ghost.x = margin + s * span;
+      ghost.y = ghostCenter.y;
+
+    } else if (ghostPath === 'vert'){
+      // NEW: edge-to-edge (with margin)
+      const margin = Math.max(40, shield.r*0.6);
+      const span = Math.max(10, H - margin*2);
+      const t = ghostT;
+      const s = (Math.sin(t) * 0.5 + 0.5); // 0..1
+      ghost.x = ghostCenter.x;
+      ghost.y = margin + s * span;
+    }
+  }
+  function drawGhostFish(){
+    ctx.save();
+    ctx.translate(ghost.x, ghost.y);
+    const aura = ctx.createRadialGradient(0,0,6, 0,0, shield.r*0.8);
+    aura.addColorStop(0,'rgba(255, 240, 170, 0.45)');
+    aura.addColorStop(1,'rgba(255, 240, 170, 0.10)');
+    ctx.fillStyle = aura;
+    ctx.beginPath(); ctx.arc(0,0, shield.r*0.95, 0, Math.PI*2); ctx.fill();
+
+    const rx = Math.max(14, 0.02 * Math.min(W,H));
+    const ry = Math.max(8,  0.012 * Math.min(W,H));
+    ctx.shadowColor = 'rgba(255,215,64,0.9)';
+    ctx.shadowBlur = 18;
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = '#ffe066';
+    ctx.beginPath(); ctx.ellipse(0,0,rx,ry,0,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(-rx,0); ctx.lineTo(-rx-rx*0.6, ry*0.9); ctx.lineTo(-rx-rx*0.6,-ry*0.9); ctx.closePath(); ctx.fill();
+
+    ctx.globalAlpha = 1;
+    ctx.fillStyle='#4b3a00';
+    ctx.beginPath(); ctx.arc(rx*0.38,-ry*0.22, Math.max(2,0.0035*Math.min(W,H)), 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+  function scoreMirrorAndFeedback(dt){
+    const dx = shield.x - ghost.x, dy = shield.y - ghost.y;
+    const d  = Math.hypot(dx, dy);
+    const R  = mirrorTolerance;
+    const frac = Math.min(1, d / R);
+
+    if (d <= R){
+      const perFrame = (1 - d / R) * 0.9;
+      score += perFrame;
+    }
+
+    let locked = false;
+    let color = 'rgba(255,82,82,0.9)';
+    if (frac <= MIRROR_GOOD) { locked = true; color = 'rgba(0,230,118,0.95)'; }
+    else if (frac <= MIRROR_OK) { color = 'rgba(255,213,79,0.95)'; }
+
+    const pulse = 1 + 0.08 * Math.sin(performance.now() * 0.008);
+    const ringR = shield.r * (1.25 * pulse);
+    ctx.save();
+    ctx.lineWidth = Math.max(2, 6 * (1 - frac));
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = 0.8;
+    ctx.beginPath();
+    ctx.arc(shield.x, shield.y, ringR, 0, Math.PI*2);
+    ctx.stroke();
+    ctx.restore();
+
+    if (locked){
+      ctx.save();
+      ctx.shadowColor = 'rgba(0,230,118,0.9)';
+      ctx.shadowBlur = 24;
+      ctx.fillStyle = 'rgba(0,230,118,0.18)';
+      ctx.beginPath();
+      ctx.arc(ghost.x, ghost.y, shield.r * 1.05, 0, Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    if (locked && !mirrorWasLocked) { playClap(); markGreat(); }
+    mirrorWasLocked = locked;
+
+    updateCoinFx(dt, locked);
+    drawCoinFx();
+
+    ctx.fillStyle = 'rgba(233,245,251,0.95)';
+    ctx.font = '16px system-ui';
+    const label = locked ? 'Locked on' : (frac <= MIRROR_OK ? 'Close' : 'Far');
+    ctx.fillText(`Mirror (${ghostPath}) — ${label} · Δ ${Math.round(d)} px`, 20, 54);
+  }
+
+  // ===== Mirror Speed Control UI =====
+  const mirrorCtl = document.createElement('div');
+  mirrorCtl.id = 'mirrorCtl';
+  mirrorCtl.style.cssText = `
+    position: fixed; left: 12px; top: 12px; z-index: 20;
+    background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.15);
+    border-radius: 12px; padding: 10px 12px; color: #e9f5fb; backdrop-filter: blur(4px);
+    font: 600 13px system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    display: none;
+  `;
+  mirrorCtl.innerHTML = `
+    <div style="margin-bottom:6px;">Mirror Speed</div>
+    <div style="display:flex;align-items:center;gap:8px;">
+      <input id="mirrorSpeed" type="range" min="0.2" max="2.0" step="0.1" value="0.9" style="width:160px;">
+      <span id="mirrorSpeedVal">0.9×</span>
+    </div>
+    <div style="opacity:.75;margin-top:6px;font-weight:500;">(0.2× – 2.0×)</div>
+  `;
+  document.body.appendChild(mirrorCtl);
+  const mirrorSpeedSlider = mirrorCtl.querySelector('#mirrorSpeed');
+  const mirrorSpeedVal = mirrorCtl.querySelector('#mirrorSpeedVal');
+  function syncMirrorSpeedUI(){
+    if (typeof ghostSpeed === 'number') {
+      mirrorSpeedSlider.value = ghostSpeed.toFixed(1);
+      mirrorSpeedVal.textContent = `${Number(mirrorSpeedSlider.value).toFixed(1)}×`;
+    }
+  }
+  syncMirrorSpeedUI();
+  mirrorSpeedSlider.addEventListener('input', () => {
+    ghostSpeed = parseFloat(mirrorSpeedSlider.value);
+    mirrorSpeedVal.textContent = `${ghostSpeed.toFixed(1)}×`;
+  });
+  window.addEventListener('keydown', (e) => {
+    if (gameMode !== 'mirror' && !(gameMode && gameMode.startsWith('mirror'))) return;
+    if (e.key === '+' || e.key === '=') {
+      mirrorSpeedSlider.stepUp(); mirrorSpeedSlider.dispatchEvent(new Event('input'));
+    } else if (e.key === '-' || e.key === '_') {
+      mirrorSpeedSlider.stepDown(); mirrorSpeedSlider.dispatchEvent(new Event('input'));
+    }
+  });
+
+  /* ===== Timed Taps (adaptive + game over) ===== */
+  let timedTargets = [];
+  let timedLastSpawn = 0;
+  let timedSpawnInterval = 1100;
+  let timedLifetime = 15000;
+  let timedLifetimeMin = 3000;
+  let timedLifetimeStep = 500;
+  let timedBaseRadius = Math.max(36, 0.04 * Math.min(W, H));
+  addEventListener('resize', () => { timedBaseRadius = Math.max(36, 0.04 * Math.min(W, H)); });
+  function randInBounds(margin = 60) { return { x: Math.random() * (W - margin * 2) + margin, y: Math.random() * (H - margin * 2) + margin }; }
+  function initTimedTaps() { timedTargets = []; timedLastSpawn = performance.now(); timedLifetime = 15000; }
+  function spawnTimedTarget(now) { const p = randInBounds(60); timedTargets.push({ x: p.x, y: p.y, bornAt: now, expiresAt: now + timedLifetime, taken: false }); }
+  function showTimedGameOver() {
+    const g = document.getElementById('gate');
+    const card = g.querySelector('.card');
+    const prev = card.innerHTML;
+    card.dataset.prev = prev;
+    card.innerHTML = `
+      <div style="font-size:20px;font-weight:700;margin-bottom:6px;">Game Over</div>
+      <div style="opacity:.85;margin-bottom:8px;">You missed the target.</div>
+      <button id="retryBtn">Retry Timed Taps</button>
+    `;
+    g.style.display = 'grid';
+    document.getElementById('retryBtn').onclick = () => {
+      card.innerHTML = card.dataset.prev || prev;
+      start('timed');
+    };
+  }
+  function updateTimedTaps() {
+    const now = performance.now();
+    if (timedTargets.length === 0 && now - timedLastSpawn >= timedSpawnInterval) { spawnTimedTarget(now); timedLastSpawn = now; }
+    for (let i = timedTargets.length - 1; i >= 0; i--) {
+      const t = timedTargets[i];
+      if (!t.taken) {
+        const dx = t.x - shield.x, dy = t.y - shield.y;
+        if (dx * dx + dy * dy < shield.r * shield.r) {
+          t.taken = true; score += 12; playCoin(); markGreat();
+          timedLifetime = Math.max(timedLifetime - timedLifetimeStep, timedLifetimeMin);
+        }
+      }
+      if (performance.now() > t.expiresAt && !t.taken) { timedTargets.splice(i, 1); gameMode = null; showTimedGameOver(); return; }
+      if (t.taken) timedTargets.splice(i, 1);
+    }
+  }
+  function drawTimedTaps() {
+    const now = performance.now();
+    for (const t of timedTargets) {
+      const remain = Math.max(0, t.expiresAt - now);
+      const pct = remain / (t.expiresAt - t.bornAt);
+      const r = timedBaseRadius * (0.9 + 0.2 * pct);
+      ctx.save();
+      ctx.shadowColor = '#ffda44'; ctx.shadowBlur = 28;
+      ctx.fillStyle = '#ffeb3b'; ctx.beginPath(); ctx.arc(t.x, t.y, r, 0, Math.PI * 2); ctx.fill();
+      ctx.lineWidth = Math.max(5, r * 0.15); ctx.strokeStyle = '#ff9800';
+      ctx.beginPath();
+      const start = -Math.PI / 2;
+      ctx.arc(t.x, t.y, r + ctx.lineWidth * 0.4, start, start + Math.PI * 2 * pct, false); ctx.stroke();
+      ctx.fillStyle = '#3b2b00'; ctx.beginPath(); ctx.arc(t.x, t.y, Math.max(6, r * 0.2), 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+    ctx.fillStyle = 'rgba(233,245,251,0.9)'; ctx.font = '16px system-ui';
+    ctx.fillText('Timed Taps — one large target at a time. Window: ' + (timedLifetime / 1000).toFixed(1) + ' s', 20, 54);
+  }
+
+  // ===== Main Loop =====
+  let lastTime = performance.now();
+  function loop(){
+    requestAnimationFrame(loop);
+    const now = performance.now();
+    const dt = Math.min(0.05, (now - lastTime) / 1000);
+    lastTime = now;
+
+    // default control
+    if (gameMode !== 'channel' && gameMode !== 'music') { shield.x = mouse.x; shield.y = mouse.y; }
+
+    ctx.clearRect(0,0,W,H);
+    ctx.fillStyle='rgba(255,255,255,0.03)'; ctx.fillRect(0,0,W,H);
+
+    if (gameMode === 'classic') {
+      coins.forEach(c => { if(!c.taken) drawCoin(c); });
+
+    } else if (gameMode === 'path') {
+      drawPathLine();
+      pathCoins.forEach((c, i) => { if (!c.taken) drawCoin(c, i, i === currentTarget); });
+
+    } else if (gameMode === 'channel') {
+      channelFishX += 1; if (channelFishX > W) channelFishX = 0;
+      shield.x = channelFishX; shield.y = mouse.y;
+      drawSineChannel();
+      channelTargets.forEach((c, i) => { if (!c.taken) drawCoin(c, i); });
+
+    } else if (gameMode === 'timed') {
+      updateTimedTaps(); drawTimedTaps();
+
+    } else if (gameMode === 'music') {
+      drawMusicRibbon(); drawMusicBubbles(); updateMusicTrail(); updateAmbient();
+
+    } else if (gameMode && gameMode.startsWith('mirror')) {
+      updateGhost(dt); drawGhostFish(); scoreMirrorAndFeedback(dt);
+    }
+
+    // Aura
+    const grd = ctx.createRadialGradient(shield.x, shield.y, 10, shield.x, shield.y, shield.r);
+    grd.addColorStop(0,'rgba(91,212,255,.50)'); grd.addColorStop(1,'rgba(91,212,255,.15)');
+    ctx.fillStyle=grd; ctx.beginPath(); ctx.arc(shield.x, shield.y, shield.r, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle='rgba(91,212,255,.85)'; ctx.lineWidth = Math.max(2, 0.004 * Math.min(W,H));
+    ctx.beginPath(); ctx.arc(shield.x, shield.y, shield.r, 0, Math.PI*2); ctx.stroke();
+
+    // Fish body
+    ctx.save(); ctx.translate(shield.x, shield.y);
+    const rx = Math.max(14, 0.02 * Math.min(W,H));
+    const ry = Math.max(8, 0.012 * Math.min(W,H));
+    ctx.fillStyle='#69ffc6';
+    ctx.beginPath(); ctx.ellipse(0,0,rx,ry,0,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(-rx,0); ctx.lineTo(-rx-rx*0.6, ry*0.9); ctx.lineTo(-rx-rx*0.6,-ry*0.9); ctx.closePath(); ctx.fill();
+    ctx.fillStyle='#083b2f';
+    ctx.beginPath(); ctx.arc(rx*0.38,-ry*0.22, Math.max(2,0.0035*Math.min(W,H)), 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+
+    // Collisions / score + claps on successes in other modes
+    const pickR2 = shield.r * shield.r;
+    if (gameMode === 'classic') {
+      coins.forEach(c => {
+        if(!c.taken){
+          const dx = c.x - shield.x, dy = c.y - shield.y;
+          if (dx*dx + dy*dy < pickR2) { c.taken = true; score += 5; playCoin(); markGreat(); }
+        }
+      });
+    } else if (gameMode === 'path') {
+      const c = pathCoins[currentTarget];
+      if (c && !c.taken) {
+        const dx = c.x - shield.x, dy = c.y - shield.y;
+        if (dx*dx + dy*dy < pickR2) { c.taken = true; score += 10; currentTarget++; playCoin(); markGreat(); }
+      }
+    } else if (gameMode === 'channel') {
+      const centerY = channelFunction(shield.x);
+      const dist = Math.abs(shield.y - centerY);
+      if (dist > channelWidth / 2) {
+        ctx.fillStyle = 'rgba(255,0,0,0.5)'; ctx.font = 'bold 22px system-ui';
+        ctx.fillText('Out of bounds!', shield.x + 20, shield.y - 10);
+      }
+      channelTargets.forEach(c => {
+        if (!c.taken) {
+          const dx = c.x - shield.x, dy = c.y - shield.y;
+          if (dx*dx + dy*dy < pickR2) { c.taken = true; score += 15; playCoin(); markGreat(); }
+        }
+      });
+    }
+    // Timed handled in its update; Music has no scoring; Mirror uses lock events
+
+    // HUD (hide score in Music mode)
+    if (gameMode !== 'music') {
+      ctx.fillStyle = '#e9f5fb'; ctx.font = '20px system-ui';
+      ctx.fillText('Score: ' + (Number.isInteger(score) ? score : score.toFixed(1)), 20, 30);
+    } else {
+      ctx.fillStyle = 'rgba(233,245,251,0.85)'; ctx.font = '18px system-ui';
+      ctx.fillText('Music Trail — relax & drift (no score)', 20, 30);
+    }
+
+    // Show Mirror speed panel only in Mirror modes
+    mirrorCtl.style.display = (gameMode && gameMode.startsWith('mirror')) ? 'block' : 'none';
+    if (gameMode && gameMode.startsWith('mirror')) syncMirrorSpeedUI();
+
+    // Stop per-mode ambient when leaving Music Trail
+    if (gameMode !== 'music') stopAmbient();
+  }
+  loop();
+
+  // ===== Buttons / start =====
+  const gate = document.getElementById('gate');
+  const btn = document.getElementById('startBtn');
+  const altBtn = document.createElement('button'); altBtn.innerText = 'Trajectory Mode';
+  const thirdBtn = document.createElement('button'); thirdBtn.innerText = 'Sine Channel Mode'; thirdBtn.style.marginLeft = '10px';
+  altBtn.style.marginLeft = '10px';
+  btn.after(altBtn); altBtn.after(thirdBtn);
+
+  const fourthBtn = document.createElement('button');
+  fourthBtn.innerText = 'Timed Taps Mode';
+  fourthBtn.style.marginLeft = '10px';
+  thirdBtn.after(fourthBtn);
+
+  const musicModeBtn = document.createElement('button');
+  musicModeBtn.innerText = 'Music Trail (Relax)';
+  musicModeBtn.style.marginLeft = '10px';
+  fourthBtn.after(musicModeBtn);
+
+  const mirrorBtn = document.createElement('button');
+  mirrorBtn.innerText = 'Mirror Mode (Random)';
+  mirrorBtn.style.marginLeft = '10px';
+  musicModeBtn.after(mirrorBtn);
+
+  const mirrorHBtn = document.createElement('button');
+  mirrorHBtn.innerText = 'Mirror (Horizontal)';
+  mirrorHBtn.style.marginLeft = '10px';
+  mirrorBtn.after(mirrorHBtn);
+
+  const mirrorVBtn = document.createElement('button');
+  mirrorVBtn.innerText = 'Mirror (Vertical)';
+  mirrorVBtn.style.marginLeft = '10px';
+  mirrorHBtn.after(mirrorVBtn);
+
+  function start(mode){
+    gameMode = mode;
+    score = 0;
+    if (mode === 'classic') initCoins();
+    else if (mode === 'path') initPathCoins();
+    else if (mode === 'channel') initChannelMode();
+    else if (mode === 'timed') initTimedTaps();
+    else if (mode === 'music') initMusicTrail();
+    else if (mode === 'mirror') initMirrorMode();                // random path
+    else if (mode === 'mirrorH') initMirrorMode('horiz');        // horizontal only (edge-to-edge)
+    else if (mode === 'mirrorV') initMirrorMode('vert');         // vertical only (edge-to-edge)
+
+    initAudioContext();
+    coinEl.volume=0.001;
+    coinEl.play().catch(()=>{}).finally(() => {
+      coinEl.pause(); coinEl.currentTime=0; coinEl.volume=0.75;
+      if(ac && ac.state==='suspended'){ ac.resume().catch(()=>{}); }
+      audioReady = true;
+      gate.style.display = 'none';
+      if (bgm.enabled) startGlobalMusic();
+    });
+  }
+  btn.onclick = () => start('classic');
+  altBtn.onclick = () => start('path');
+  thirdBtn.onclick = () => start('channel');
+  fourthBtn.onclick = () => start('timed');
+  musicModeBtn.onclick = () => start('music');
+  mirrorBtn.onclick = () => start('mirror');
+  mirrorHBtn.onclick = () => start('mirrorH');
+  mirrorVBtn.onclick = () => start('mirrorV');
+
+  </script>
+</body>
+</html>
