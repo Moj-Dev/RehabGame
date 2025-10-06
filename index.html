@@ -2,10 +2,12 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Fish Trail — Classic / Trajectory / Sine Channel / Timed Taps / Music Trail / Mirror</title>
   <style>
     html,body { height: 100%; margin: 0; background: linear-gradient(180deg, #0e1a22, #0f2632); color: #e9f5fb; font-family: system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif; overflow: hidden; }
+    /* IMPORTANT for mobile: disable browser gestures on the game surface */
+    html, body, canvas { touch-action: none; -ms-touch-action: none; }
     canvas { display:block; margin:0; background:transparent; }
     .hint { position: fixed; bottom: 12px; left: 0; right: 0; text-align: center; opacity: .75; font-size: 14px; pointer-events: none; }
     .gate { position: fixed; inset: 0; display: grid; place-items: center; background: rgba(0,0,0,.55); z-index: 10; }
@@ -47,12 +49,50 @@
   resize();
   addEventListener('resize', resize);
 
-  // ===== Input / player =====
-  const mouse = { x: W/2, y: H/2 };
-  canvas.addEventListener('mousemove', e => {
+  // ===== Input (Pointer Events -> works for mouse + touch + pen) =====
+  const mouse = { x: W/2, y: H/2 }; // keep the same name so the rest of the code just works
+  let dragging = false;
+
+  function setFromEvent(e){
     const r = canvas.getBoundingClientRect();
-    mouse.x = e.clientX - r.left; mouse.y = e.clientY - r.top;
-  });
+    // pointer events always have clientX/Y; for safety also check TouchEvent
+    let cx = e.clientX, cy = e.clientY;
+    if (cx == null && e.touches && e.touches[0]) {
+      cx = e.touches[0].clientX; cy = e.touches[0].clientY;
+    }
+    mouse.x = Math.max(0, Math.min(W, cx - r.left));
+    mouse.y = Math.max(0, Math.min(H, cy - r.top));
+  }
+
+  // Use non-passive so we can prevent scrolling/dragging
+  canvas.addEventListener('pointerdown', (e) => {
+    setFromEvent(e);
+    dragging = true;
+    try { canvas.setPointerCapture(e.pointerId); } catch {}
+    e.preventDefault();
+  }, { passive: false });
+
+  canvas.addEventListener('pointermove', (e) => {
+    // On touch, only update while "dragging" to avoid stray moves;
+    // on mouse, always update (pointerType === 'mouse')
+    if (e.pointerType === 'mouse' || dragging) setFromEvent(e);
+    // no preventDefault here for mouse move (keeps desktop smooth)
+  }, { passive: true });
+
+  const endDrag = (e) => {
+    dragging = false;
+    try { canvas.releasePointerCapture(e.pointerId); } catch {}
+    e.preventDefault();
+  };
+  canvas.addEventListener('pointerup', endDrag, { passive: false });
+  canvas.addEventListener('pointercancel', endDrag, { passive: false });
+  canvas.addEventListener('lostpointercapture', () => { dragging = false; });
+
+  // Fallback for very old browsers that lack Pointer Events (rare, but safe)
+  canvas.addEventListener('touchstart', (e) => { setFromEvent(e); dragging = true; e.preventDefault(); }, { passive: false });
+  canvas.addEventListener('touchmove', (e) => { if (dragging) setFromEvent(e); e.preventDefault(); }, { passive: false });
+  canvas.addEventListener('touchend', () => { dragging = false; }, { passive: false });
+
   const shield = { x: mouse.x, y: mouse.y, r: 0.1 * Math.min(W,H) };
   addEventListener('resize', () => { shield.r = 0.1 * Math.min(W,H); });
 
@@ -287,7 +327,7 @@
     const norm = Math.min(1, deviation / (musicWidth));
     const baseFreq = 900, add = 900;
     ambient.f.frequency.setTargetAtTime(baseFreq + add * (1 - norm), ac.currentTime, 0.3);
-    ambient.g.gain.setTargetAtTime(0.001 + 0.002 * (1 - norm), ac.currentTime, 0.4);
+    ambient.gain && ambient.g && ambient.g.gain && ambient.g.gain.setTargetAtTime && ambient.g.gain.setTargetAtTime(0.001 + 0.002 * (1 - norm), ac.currentTime, 0.4);
   }
 
   /* ================================
@@ -362,20 +402,18 @@
   const MIRROR_OK   = 0.70;
   let mirrorWasLocked = false;
 
-  // ===== Coin Rain FX (WIDER right band + BIGGER coins) =====
+  // ===== Coin Rain FX (right-side band) =====
   let coinFx = { items: [], spawnTimer: 0 };
   function spawnCoinFx(n){
-    // Wider right-side band (approx right 40% of screen), with margins
     const margin = 40;
     const bandWidth = Math.max(240, W * 0.40);
     const minX = Math.max(margin, W - bandWidth + margin);
     const maxX = Math.min(W - margin, W - margin);
-    // Bigger coins
-    const baseR = Math.max(10, 0.02 * Math.min(W,H)); // previously ~0.012
+    const baseR = Math.max(10, 0.02 * Math.min(W,H));
     for (let i=0;i<n;i++){
       const x = minX + Math.random() * (maxX - minX);
-      const r = baseR * (0.8 + Math.random()*1.2);    // ~0.8x–2.0x base
-      const vy = 200 + Math.random()*220;             // slightly faster for larger coins
+      const r = baseR * (0.8 + Math.random()*1.2);
+      const vy = 200 + Math.random()*220;
       const rot = Math.random()*Math.PI*2;
       const omega = (Math.random()*2 - 1) * 2.2;
       const life = 1.2 + Math.random()*0.6;
@@ -386,7 +424,7 @@
   function updateCoinFx(dt, locked){
     if (locked){
       coinFx.spawnTimer += dt;
-      const rate = 32; // a bit denser with larger coins
+      const rate = 32;
       const toSpawn = Math.floor(coinFx.spawnTimer * rate);
       if (toSpawn > 0){ coinFx.spawnTimer -= toSpawn / rate; spawnCoinFx(toSpawn); }
     } else {
@@ -455,24 +493,22 @@
 
     } else if (ghostPath === 'liss'){
       const t = ghostT;
-      ghost.x = ghostCenter.x + Math.sin(t * ghostFreq.x + 0.7) * ghostAmp.x * 0.45;
-      ghost.y = ghostCenter.y + Math.sin(t * ghostFreq.y) * ghostAmp.y * 0.55;
+      ghost.x = ghostCenter.x + Math.sin(t * 0.6 + 0.7) * ghostAmp.x * 0.45;
+      ghost.y = ghostCenter.y + Math.sin(t * 0.9) * ghostAmp.y * 0.55;
 
     } else if (ghostPath === 'horiz'){
-      // NEW: edge-to-edge (with margin)
       const margin = Math.max(40, shield.r*0.6);
       const span = Math.max(10, W - margin*2);
       const t = ghostT;
-      const s = (Math.sin(t) * 0.5 + 0.5); // 0..1
+      const s = (Math.sin(t) * 0.5 + 0.5);
       ghost.x = margin + s * span;
       ghost.y = ghostCenter.y;
 
     } else if (ghostPath === 'vert'){
-      // NEW: edge-to-edge (with margin)
       const margin = Math.max(40, shield.r*0.6);
       const span = Math.max(10, H - margin*2);
       const t = ghostT;
-      const s = (Math.sin(t) * 0.5 + 0.5); // 0..1
+      const s = (Math.sin(t) * 0.5 + 0.5);
       ghost.x = ghostCenter.x;
       ghost.y = margin + s * span;
     }
@@ -513,8 +549,8 @@
 
     let locked = false;
     let color = 'rgba(255,82,82,0.9)';
-    if (frac <= MIRROR_GOOD) { locked = true; color = 'rgba(0,230,118,0.95)'; }
-    else if (frac <= MIRROR_OK) { color = 'rgba(255,213,79,0.95)'; }
+    if (frac <= 0.35) { locked = true; color = 'rgba(0,230,118,0.95)'; }
+    else if (frac <= 0.70) { color = 'rgba(255,213,79,0.95)'; }
 
     const pulse = 1 + 0.08 * Math.sin(performance.now() * 0.008);
     const ringR = shield.r * (1.25 * pulse);
@@ -546,7 +582,7 @@
 
     ctx.fillStyle = 'rgba(233,245,251,0.95)';
     ctx.font = '16px system-ui';
-    const label = locked ? 'Locked on' : (frac <= MIRROR_OK ? 'Close' : 'Far');
+    const label = locked ? 'Locked on' : (frac <= 0.70 ? 'Close' : 'Far');
     ctx.fillText(`Mirror (${ghostPath}) — ${label} · Δ ${Math.round(d)} px`, 20, 54);
   }
 
@@ -710,7 +746,7 @@
     ctx.beginPath(); ctx.arc(rx*0.38,-ry*0.22, Math.max(2,0.0035*Math.min(W,H)), 0, Math.PI*2); ctx.fill();
     ctx.restore();
 
-    // Collisions / score + claps on successes in other modes
+    // Collisions / score
     const pickR2 = shield.r * shield.r;
     if (gameMode === 'classic') {
       coins.forEach(c => {
@@ -739,9 +775,8 @@
         }
       });
     }
-    // Timed handled in its update; Music has no scoring; Mirror uses lock events
 
-    // HUD (hide score in Music mode)
+    // HUD
     if (gameMode !== 'music') {
       ctx.fillStyle = '#e9f5fb'; ctx.font = '20px system-ui';
       ctx.fillText('Score: ' + (Number.isInteger(score) ? score : score.toFixed(1)), 20, 30);
@@ -750,8 +785,9 @@
       ctx.fillText('Music Trail — relax & drift (no score)', 20, 30);
     }
 
-    // Show Mirror speed panel only in Mirror modes
-    mirrorCtl.style.display = (gameMode && gameMode.startsWith('mirror')) ? 'block' : 'none';
+    // Mirror panel visibility
+    const mirrorCtlEl = document.getElementById('mirrorCtl');
+    mirrorCtlEl.style.display = (gameMode && gameMode.startsWith('mirror')) ? 'block' : 'none';
     if (gameMode && gameMode.startsWith('mirror')) syncMirrorSpeedUI();
 
     // Stop per-mode ambient when leaving Music Trail
@@ -801,8 +837,8 @@
     else if (mode === 'timed') initTimedTaps();
     else if (mode === 'music') initMusicTrail();
     else if (mode === 'mirror') initMirrorMode();                // random path
-    else if (mode === 'mirrorH') initMirrorMode('horiz');        // horizontal only (edge-to-edge)
-    else if (mode === 'mirrorV') initMirrorMode('vert');         // vertical only (edge-to-edge)
+    else if (mode === 'mirrorH') initMirrorMode('horiz');        // horizontal only
+    else if (mode === 'mirrorV') initMirrorMode('vert');         // vertical only
 
     initAudioContext();
     coinEl.volume=0.001;
